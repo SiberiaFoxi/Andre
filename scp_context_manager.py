@@ -1,5 +1,7 @@
 """Token-budgeted Gemma turns. WARM summaries are keyed by content on disk."""
 
+from scp_diagnostics import measured
+
 import hashlib
 import re
 from collections import Counter
@@ -90,6 +92,7 @@ class ContextManager:
                     hist = block + hist
         return sys + hist + end
 
+    @measured('context_manager')
     def prepare(self, messages, max_tokens, model_fn=None, count=None):
         system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         history = [m for m in messages if m["role"] != "system"]

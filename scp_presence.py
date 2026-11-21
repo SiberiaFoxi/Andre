@@ -1,5 +1,7 @@
 """Присутствие между сеансами."""
 
+from scp_diagnostics import measured
+
 import time
 from threading import RLock
 
@@ -30,6 +32,7 @@ class PresenceTracker:
         ) | read(self.path, {})
 
     @locked
+    @measured('presence')
     def tick(self):
         d = self.data
         now = self.clock()
@@ -59,6 +62,7 @@ class PresenceTracker:
         return self.data["absence_bucket"]
 
     @locked
+    @measured('presence')
     def on_user_message(self):
         self.tick()
         d = self.data
@@ -71,6 +75,7 @@ class PresenceTracker:
         self.tick()
 
     @locked
+    @measured('presence')
     def on_app_start(self):
         d = self.data
         now = self.clock()
@@ -82,6 +87,7 @@ class PresenceTracker:
         self.bus.emit("app_started")
 
     @locked
+    @measured('presence')
     def on_app_close(self):
         self.bus.emit("app_closed")
         self.tick()

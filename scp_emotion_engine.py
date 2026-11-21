@@ -1,5 +1,7 @@
 """Затухание и композиция эмоций."""
 
+from scp_diagnostics import measured
+
 import math
 import time
 from collections import deque
@@ -80,6 +82,7 @@ class EmotionEngine:
         )
 
     @synchronized
+    @measured('emotion_engine')
     def cool(self, elapsed=None):
         now = time.time()
         h = max(0, elapsed if elapsed is not None else now - self.last_cool) / 3600
@@ -92,6 +95,7 @@ class EmotionEngine:
         self.persist()
 
     @synchronized
+    @measured('emotion_engine')
     def apply_event(self, event_type, payload=None, **kwargs):
         p = (payload or {}) | kwargs
         if event_type == "user_returned":

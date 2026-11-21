@@ -1,5 +1,7 @@
 """Additional local v4 tools and owner-confirmation helpers."""
 
+from scp_diagnostics import measured
+
 import ast
 import inspect
 import math
@@ -233,6 +235,7 @@ class LocalTool:
             for k in list(inspect.signature(self.fn).parameters)[1:]
         ]
 
+    @measured('tools_extra')
     def execute(self, **kwargs):
         return str(self.fn(self.env, **kwargs))
 

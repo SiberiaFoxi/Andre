@@ -8,6 +8,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from scp_context_manager import ContextManager
+from scp_diagnostics import event
 
 __all__ = [
     "PromptCache",
@@ -113,7 +114,8 @@ class Answer(str):
 
 
 class Accelerator:
-    def __init__(self, model, root, n_ctx, bus=None):
+    def __init__(self, model, root, n_ctx, bus=None, settings=None):
+        self.settings = dict(settings or {})
         self.model = model
         self.context = ContextManager(n_ctx, root)
         self.cache = PromptCache()
@@ -153,13 +155,18 @@ class Accelerator:
         top_p=0.9,
         on_chunk=None,
     ):
-        self.deadline = time.monotonic() + (
-            30 if kind == "thought" else 60 if priority >= 20 else 120
-        )
+        seconds = 30 if kind=='thought' else 60 if priority>=20 else self.settings.get('user_timeout_seconds',0)
+        self.deadline = time.monotonic()+seconds if seconds else float('inf')
+        started=time.monotonic()
+        event('llm','request',kind=kind,timeout_seconds=seconds,messages=len(messages))
         try:
-            return self._generate(
-                messages, priority, kind, max_tokens, temperature, top_p, on_chunk
-            )
+            return self._generate(messages,priority,kind,max_tokens,temperature,top_p,on_chunk)
+        except Exception as exc:
+            timed_out=time.monotonic()>=self.deadline
+            event('llm','failed',reason='timeout' if timed_out else type(exc).__name__,elapsed_s=round(time.monotonic()-started,2))
+            self.model.reset()
+            if timed_out: raise TimeoutError(f'Лимит генерации {seconds} с. Увеличьте его в настройках ускорения или установите 0.') from exc
+            raise
         finally:
             self.deadline = float("inf")
 
@@ -175,14 +182,16 @@ class Accelerator:
     ):
         start = time.monotonic()
         n = min(max_tokens, AdaptiveTokens.limit(messages[-1]["content"], kind))
+        if not self.settings.get('adaptive_tokens',True): n=max_tokens
         prompt = self.context.prepare(
             messages,
             n,
-            self.summarize if self.compact else None,
+            self.summarize if self.compact and self.settings.get("model_summaries",False) else None,
             lambda s: len(self.prefix.tokens(self.model, s)),
         )
         key = hashlib.sha256(repr((prompt, n, temperature, top_p)).encode()).digest()
-        if key in self.cache:
+        if self.settings.get("answer_cache",True) and key in self.cache:
+            event("llm","cache_hit")
             self.cache.move_to_end(key)
             text = self.cache[key]
             self.perf.record(0, start, start, True)
@@ -192,6 +201,7 @@ class Accelerator:
                 on_chunk(text)
             return Answer(text, True)
         ids = self.prefix.tokens(self.model, prompt)
+        event("llm","prefill_start",prompt_tokens=len(ids),max_tokens=n,n_ctx=self.n_ctx)
         if len(ids) + n > self.n_ctx:
             raise ValueError("Обязательный контекст не помещается в n_ctx.")
         from llama_cpp import StoppingCriteriaList
@@ -205,22 +215,24 @@ class Accelerator:
             top_p=top_p,
             stream=True,
             stop=["<end_of_turn>", "\n\n\n"],
-            stopping_criteria=StoppingCriteriaList([EarlyStop(self.model)]),
+            stopping_criteria=StoppingCriteriaList([EarlyStop(self.model)] if self.settings.get("early_stop",True) else []),
         ):
             text = chunk["choices"][0]["text"]
             if not parts:
                 first = time.monotonic()
+                event("llm","first_chunk",elapsed_s=round(first-start,2))
             parts.append(text)
             if on_chunk:
                 on_chunk(text)
         text = "".join(parts).strip()
         if time.monotonic() >= self.deadline:
             raise TimeoutError("Истекло время генерации")
-        if text and not re.search(
+        if self.settings.get("answer_cache",True) and text and not re.search(
             r"\[(?:TOOL|CMD|CREATEFILE|WEBSEARCH|REMIND|SPEAK):", text, re.I
         ):
             self.cache.put(key, text)
         self.perf.record(
             len(self.model.tokenize(text.encode(), add_bos=False)), start, first, False
         )
+        event("llm","complete",elapsed_s=round(time.monotonic()-start,2),output_chars=len(text))
         return Answer(text)

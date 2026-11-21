@@ -388,6 +388,17 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), "utf-8")
 
 CFG = load_config()
+ACCEL_OPTIONS = {
+    'accelerator_enabled': ('Ручной шаблон Gemma и ускоритель (выкл. — шаблон GGUF)', True),
+    'short_chat_prompt': ('Короткий промт для приветствий', True),
+    'answer_cache': ('Кэш готовых ответов', True),
+    'adaptive_tokens': ('Адаптивный предел ответа', True),
+    'early_stop': ('Останавливать повтор фразы', True),
+    'prewarm': ('Прогрев одним токеном при загрузке', True),
+    'model_summaries': ('Сжимать историю моделью (дополнительный вызов CPU)', False),
+}
+for key, (_, default) in ACCEL_OPTIONS.items(): CFG.setdefault(key, default)
+CFG.setdefault('user_timeout_seconds', 0)
 for _key, _value in dict(accelerator_enabled=True, context_manager_enabled=True, emotion_v2_enabled=True,
         presence_enabled=True, proactive_enabled=True, proactive_min_gap_minutes=240, proactive_daily_limit=4,
         proactive_quiet_hours="23:00-08:00", short_memory_ttl_hours=72, dedup_jaccard_threshold=.75,
@@ -564,11 +575,20 @@ def ensure_personal_space() -> None:
     (personal_folder() / "журнал").mkdir(parents=True, exist_ok=True)
 
 ensure_personal_space()
+try:
+    from scp_diagnostics import VERSION, configure, event
+    configure(workspace())
+except (ImportError, OSError):
+    VERSION = '4.1.0'
+    def event(component, action, **fields): log.info('%s.%s %s',component,action,fields)
+event('app','startup',accelerator=ACCEL_OK,memory=MEMORY_V2_OK,tts=TTS_V2_OK,avatar=AVATAR_MODULE_OK,tools=TOOLS_EXTRA_OK,autonomy=AUTONOMY_V2_OK)
 # ВСТАВИТЬ: после создания workspace, до конструкторов v4, читающих JSON.
 from types import SimpleNamespace
 event_bus = EventBus() if BUS_OK else None
+if event_bus: event_bus.subscribe('*',lambda kind,payload:event('events',kind,tool=payload.get('tool')))
 presence = PresenceTracker(workspace(), event_bus) if PRESENCE_OK and event_bus and CFG['presence_enabled'] else None
 if MEMORY_V2_OK:
+    event('memory','migration_check',already_migrated=(workspace()/'migration_v2.json').exists())
     MemoryMigrator().migrate_from_v4_once(workspace(), CFG)
     memcfg = MemoryConfig(workspace(), CFG)
     archive = LongTermMemory(workspace())
@@ -1997,6 +2017,7 @@ class ToolRegistry:
                     ctx = str(getattr(_CURRENT_CTX,'value',''))
                     if ctx.startswith('tg:'): approved = tg_bridge.confirm_tool(ctx,tool_name,kwargs)
                     else: approved = ctx=='local' and gui_gate and gui_gate.confirm(tool_name,kwargs)
+                    event("tools","confirmation",tool=tool_name,approved=bool(approved))
                     if not approved: return 'Действие не подтверждено.'
                 if tool_name in ('clipboard','screenshot'):
                     if not gui_gate: return 'Нет графической сессии.'
@@ -3276,6 +3297,9 @@ class SileroTTS(QObject):
         if not text:
             raise ValueError("Пустой текст для синтеза")
         target_path = Path(target_path)
+        if not Path(CFG.get('tts_model_path') or '').is_file():
+            event('tts','system_fallback',reason='no_local_silero')
+            return self._synthesize_pyttsx3(text,target_path)
         try:
             with self._model_lock:
                 self._load_model()
@@ -3606,7 +3630,7 @@ def make_avatar_selfie():
     return callback()
 
 
-def render_system_prompt(user_text=""):
+def render_system_prompt(user_text="", casual=False):
     now_s = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
     values = _SafeDict(
         ai_name=CFG.get("ai_name", "SCP-079-Derenguh"),
@@ -3617,6 +3641,8 @@ def render_system_prompt(user_text=""):
                          getattr(_CURRENT_REQUEST, "is_owner", False) else "(недоступно)"),
     )
     template = str(CFG.get("system_prompt") or DEFAULT_SYSTEM_PROMPT)
+    if casual and template == DEFAULT_SYSTEM_PROMPT:
+        template = 'Ты {ai_name}, Андреа. Ответь естественно и коротко по-русски. Память: {long_memory} {personal_memory}'
     try:
         prompt = template.format_map(values)
     except Exception:
@@ -3630,7 +3656,7 @@ def render_system_prompt(user_text=""):
                 prompt += "\n\nДополнительный контекст о создателе:\n" + creator_context
     except Exception as exc:
         log.debug("Creator context render skipped: %s", exc)
-    prompt += (
+    if not casual: prompt += (
         "\n\nОБЯЗАТЕЛЬНЫЙ СТИЛЬ ОБЩЕНИЯ АНДРЕА: "
         "простые бытовые реплики и приветствия — 1–2 естественных предложения; "
         "не отвечай на ласковое обращение философским эссе и не объясняй без запроса, "
@@ -3726,9 +3752,11 @@ def handle_incoming(user_text, reply_fn, voice_fn, circle_fn, ctx_id):
         if answer is None:
             if not clean_text:
                 clean_text = "Кратко ответь на основе контекста предыдущего диалога."
-            system_prompt = render_system_prompt(clean_text)
-            forced_context, forced_tool = llm._forced_tool_request(clean_text)
-            pre_search = forced_context or llm._pre_search_context(clean_text)
+            casual = CFG['short_chat_prompt'] and bool(re.fullmatch(r'(?:привет|здравствуй|добрый (?:день|вечер)|как дела|как ты)[\s,!?.]*(?:(?:как ты|как дела)[\s!?.,]*)?',clean_text.strip(),re.I))
+            system_prompt = render_system_prompt(clean_text,casual)
+            event('chat','prepare',casual=casual,system_chars=len(system_prompt))
+            forced_context, forced_tool = ("","") if casual else llm._forced_tool_request(clean_text)
+            pre_search = "" if casual else forced_context or llm._pre_search_context(clean_text)
             tools_desc = tool_registry.list_tools()
             runtime = (
                 "\n\nДОСТУПНЫЕ ИНСТРУМЕНТЫ:\n" + tools_desc +
@@ -3737,6 +3765,7 @@ def handle_incoming(user_text, reply_fn, voice_fn, circle_fn, ctx_id):
                 "Пиши естественно и содержательно: сначала прямой ответ, затем необходимые пояснения. "
                 "Не повторяй вопрос пользователя и не отвечай общими фразами."
             )
+            if casual: runtime=''
             user_content = f"{username}: {clean_text}"
             if pre_search:
                 user_content += "\n\n[Результаты автоматического поиска/инструмента — используй их]:\n" + pre_search
@@ -3789,7 +3818,10 @@ def handle_incoming(user_text, reply_fn, voice_fn, circle_fn, ctx_id):
                     answer = "Не удалось получить корректный ответ. Проверь модель и журнал aria.log."
             except Exception as exc:
                 log.exception("handle_incoming generation failed: %s", exc)
-                answer = "Не получилось получить ответ от модели. Подробности записаны в aria.log."
+                answer = (str(exc) if isinstance(exc,(ValueError,TimeoutError)) else 'Ошибка локальной модели: '+str(exc)[:180])
+                _CURRENT_REQUEST.generation_error = True
+                if callable(reply_fn): reply_fn(answer)
+                return dict(format='text',text=answer,path=None,error=type(exc).__name__)
 
         if emotion_engine and SAFETY_OK: answer = SafetyLayer.filter(answer,emotion_engine.values)
         short_mem.add(ctx_id, "user", f"[{username}]: {original_text}")
@@ -3872,6 +3904,7 @@ def handle_incoming(user_text, reply_fn, voice_fn, circle_fn, ctx_id):
 
         return {"format": fmt, "text": answer, "path": None, "error": None}
     finally:
+        _CURRENT_REQUEST.generation_error = False
         _CURRENT_CTX.value = "local"
         _CURRENT_REQUEST.is_owner = False
         _CURRENT_REQUEST.emotion_applied = False
@@ -3885,6 +3918,9 @@ def install_chat_wrapper():
         return
 
     def wrapped(messages, max_tokens=512, temperature=0.7, top_p=0.9):
+        # render_system_prompt + handle_incoming have already added mood and history.
+        if getattr(_CURRENT_REQUEST, 'emotion_applied', False):
+            return original(messages,max_tokens=max_tokens,temperature=temperature,top_p=top_p)
         prepared = messages
         try:
             prepared = [dict(m) for m in messages]
@@ -4530,14 +4566,18 @@ class LLMWorker(QObject):
                 loaded = Llama(**llama_kwargs)
                 self.accelerator = None
                 if ACCEL_OK and CFG['accelerator_enabled']:
-                    self.accelerator = Accelerator(loaded,workspace(),llama_kwargs['n_ctx'],event_bus)
-                    PreWarm.run(loaded)
+                    self.accelerator = Accelerator(loaded,workspace(),llama_kwargs['n_ctx'],event_bus,CFG)
+                    if CFG["prewarm"]: PreWarm.run(loaded)
                     self.accelerator.compact = CFG["context_manager_enabled"]
                 self._llm = loaded
                 self._ready = True
-                self.status_msg.emit("Модель готова ✓", True)
-                log.info(f"GGUF загружена: {path}; chat_format={chat_format or 'auto (из GGUF)'}")
-                activity_logger.log_system(f"GGUF загружена: {Path(path).name} (шаблон: {chat_format or 'авто'})")
+                template = 'Gemma вручную' if self.accelerator else chat_format or 'llama.cpp / GGUF'
+                model_name = (loaded.metadata or {}).get('general.name') or Path(path).stem
+                info = f"{Path(path).name} · {model_name} · CPU · ctx {llama_kwargs['n_ctx']} · {template}"
+                self.status_msg.emit('Готова: '+info,True)
+                event('model','loaded',file=Path(path).name,name=model_name,template=template,n_ctx=llama_kwargs['n_ctx'],threads=llama_kwargs['n_threads'],options={k:CFG[k] for k in ACCEL_OPTIONS},timeout_seconds=CFG['user_timeout_seconds'])
+                log.info('Андреа %s | %s',VERSION,info)
+                activity_logger.log_system('GGUF загружена: '+info)
             except Exception as e:
                 self.status_msg.emit(f"Ошибка загрузки: {e}", False)
                 log.error(f"LLM load: {e}")
@@ -6220,6 +6260,20 @@ class SettingsTab(QWidget):
         self._row("Слоёв GPU:", self.n_gpu); self._row("Temperature:", self.temp)
         self._row("Top-P:", self.top_p); self._row("Repeat Penalty:", self.rep_pen)
         self._row("Макс. токенов:", self.max_tok)
+        self._section(f"⚡ Ускорение · Андреа {VERSION}")
+        self.accel_checks = {}
+        for key,(title,_) in ACCEL_OPTIONS.items():
+            box=QCheckBox(title); box.setChecked(bool(CFG[key])); lay.addWidget(box); self.accel_checks[key]=box
+        self.timeout_spin=self._spin(0,3600,int(CFG['user_timeout_seconds']))
+        self.timeout_spin.setSpecialValueText('Без тайм-аута')
+        self._row('Лимит ответа CPU, сек:',self.timeout_spin)
+        lay.addWidget(QLabel('После изменения нажмите «Загрузить модель».'))
+        diag=QPushButton('Открыть журнал features.jsonl'); lay.addWidget(diag)
+        def show_diag():
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str((workspace()/'features.jsonl').resolve())))
+        diag.clicked.connect(show_diag)
         self._model_status = QLabel("—"); lay.addWidget(self._model_status)
         b_load = QPushButton("⚡ Загрузить модель"); b_load.setObjectName("green")
         b_load.clicked.connect(self._load_model); lay.addWidget(b_load)
@@ -6293,6 +6347,8 @@ class SettingsTab(QWidget):
         if p: self.model_path.setText(p)
 
     def _collect(self):
+        CFG.update({k:box.isChecked() for k,box in self.accel_checks.items()})
+        CFG['user_timeout_seconds']=self.timeout_spin.value()
         CFG["ai_name"] = self.ai_name.text().strip() or "SCP-079-Derenguh"
         CFG["creator_name"] = self.creator.text().strip() or "Создатель"
         CFG.setdefault("tts_enabled", True)
@@ -6332,6 +6388,7 @@ class SettingsTab(QWidget):
         self._collect(); path = CFG["model_path"]
         if not path:
             QMessageBox.warning(self, "Нет пути", "Укажите путь к модели."); return
+        save_config(CFG)
         self._model_status.setText("Загрузка…")
         llm.load_model(path)
 
@@ -6603,7 +6660,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"✦ {CFG['ai_name']} — AI Assistant")
+        self.setWindowTitle(f"✦ {CFG['ai_name']} — Андреа {VERSION}")
         self.resize(1200, 780); self.setMinimumSize(900, 600); self.setStyleSheet(DARK_QSS)
         center = QWidget(); self.setCentralWidget(center)
         root = QHBoxLayout(center); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
@@ -6891,7 +6948,7 @@ class MainWindow(QMainWindow):
 
         def reply_fn(answer):
             llm.response_ready.emit(answer)
-            tts.speak(answer)
+            if not getattr(_CURRENT_REQUEST,"generation_error",False): tts.speak(answer)
 
         def voice_fn(path):
             self.lively_media_ready.emit("voice", str(path))
@@ -6943,7 +7000,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"⬤ {msg}"); self.lbl_status.setStyleSheet(f"color:{color};font-weight:600;")
         self.prog.setVisible(waiting); self.set_t.update_model_status(msg, ok)
         if ok:
-            self.sb.showMessage(f"Модель готова ✓ | Автономный агент активен")
+            self.sb.showMessage(msg)
             activity_logger.log_system("Модель загружена.")
             # ФИКС: не запускаем бот автоматически — только по явной команде
             # (устраняет множественные параллельные запуски)
@@ -6960,7 +7017,7 @@ class MainWindow(QMainWindow):
         log.info(status); self.sb.showMessage(status)
 
     def _on_saved(self):
-        self.setWindowTitle(f"✦ {CFG['ai_name']} — AI Assistant")
+        self.setWindowTitle(f"✦ {CFG['ai_name']} — Андреа {VERSION}")
 
     def _on_tg_in(self, uname, text): self.chat_t.append(f"📱 {uname}", text, "#ffd54f")
 

@@ -1,5 +1,7 @@
 """Локальные архивы сообщений, дневник, профиль и перенос данных v4."""
 
+from scp_diagnostics import measured
+
 import hashlib
 import json
 import time
@@ -35,6 +37,7 @@ class ShortTermMemory:
             + ".jsonl"
         )
 
+    @measured('memory')
     def add(self, ctx, role, text, meta=None):
         self.hot.pop(ctx, None)
         p = self.path(ctx)
@@ -54,6 +57,7 @@ class ShortTermMemory:
                 + "\n"
             )
 
+    @measured('memory')
     def get_window(self, ctx, n):
         p = self.path(ctx)
         # Read from the tail: fetching HOT must not parse 5 MiB on every turn.
@@ -100,11 +104,13 @@ class ShortTermMemory:
     def summarize(self, ctx):
         return " ".join(r["text"][:80] for r in self.get_hot(ctx))
 
+    @measured('memory')
     def clear(self, ctx):
         self.hot.pop(ctx, None)
         for f in self.root.glob(self.path(ctx).stem + "*.jsonl"):
             f.unlink()
 
+    @measured('memory')
     def clear_all(self):
         self.hot.clear()
         for summary in (self.cfg.root / "summaries").glob("*.json"):
@@ -112,6 +118,7 @@ class ShortTermMemory:
         for f in self.root.glob("*.jsonl"):
             f.unlink()
 
+    @measured('memory')
     def gc_expired(self):
         self.hot.clear()
         for summary in (self.cfg.root / "summaries").glob("*.json"):
@@ -136,6 +143,7 @@ class LongTermMemory:
         self.root.mkdir(exist_ok=True)
 
     @locked
+    @measured('memory')
     def add_diary(self, text, tags=(), source="autonomy"):
         day = str(date.today())
         tags = list(tags)
@@ -160,6 +168,7 @@ class LongTermMemory:
         save(p, sorted(set(read(p, [])) | set(tags)))
 
     @locked
+    @measured('memory')
     def add_fact(self, text, source, confidence=1.0):
         now = time.time()
         with (self.root / "facts.jsonl").open("a", encoding="utf8") as f:
@@ -218,6 +227,7 @@ class CreatorProfile:
         ) | read(self.path, {})
 
     @locked
+    @measured('memory')
     def observe(self, text):
         for prefix, key in [
             ("меня зовут ", "name"),
@@ -253,6 +263,7 @@ class MemoryConfig(dict):
 class MemoryMigrator:
     """Read legacy files before constructing their v4 owners. Preserve exact backups."""
 
+    @measured('memory')
     def migrate_from_v4_once(self, workspace_path, cfg=None):
         root = Path(workspace_path)
         root.mkdir(parents=True, exist_ok=True)

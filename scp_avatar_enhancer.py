@@ -1,5 +1,7 @@
 """Non-destructive animation for a rigged v5.3 companion canvas."""
 
+from scp_diagnostics import measured
+
 import math
 import random
 import time
@@ -65,6 +67,7 @@ class AvatarAnimator(QTimer):
         )
         return r
 
+    @measured('avatar_enhancer')
     def address(self, question=False):
         self.w._next_blink_ms = 0
         self.tilt_until = time.monotonic() + (0.7 if question else 0)

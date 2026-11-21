@@ -1,5 +1,7 @@
 """Local WAV synthesis/cache; v4 retains its Qt signals and Telegram Opus conversion."""
 
+from scp_diagnostics import measured,event
+
 import hashlib
 import math
 import shutil
@@ -19,6 +21,7 @@ class TTSPlayer:
         self.levels = []
         self.start = 0
 
+    @measured('tts')
     def play(self, path):
         try:
             import pygame
@@ -103,6 +106,7 @@ class TTSEngine:
             f.writeframes(pcm.tobytes())
         return True
 
+    @measured('tts')
     def synthesize(self, text, mood="calm"):
         with self.lock:
             if isinstance(mood, tuple):
@@ -111,6 +115,7 @@ class TTSEngine:
             path = self.root / (hashlib.sha1(key.encode()).hexdigest() + ".wav")
             tmp = path.with_suffix(".tmp.wav")
             if path.exists():
+                event("tts","wav_cache_hit")
                 path.touch()
                 return path
             model = Path(
@@ -152,6 +157,7 @@ class TTSEngine:
                 if self.cfg["tts_backend"] == "xtts" and self._xtts(text, tmp, speed):
                     pass
                 elif cmd:
+                    event("tts","synthesis_backend",backend=Path(cmd[0]).stem)
                     subprocess.run(cmd, input=text.encode(), timeout=90, check=True)
                 elif self.fallback:
                     self.fallback(text, tmp)

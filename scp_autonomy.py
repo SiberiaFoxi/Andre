@@ -1,5 +1,7 @@
 """Сценарии, источники и фильтр повторов дневника."""
 
+from scp_diagnostics import measured
+
 import hashlib
 import re
 from collections import deque
@@ -52,6 +54,7 @@ class ThoughtDeduplicator:
         self.threshold = threshold
         self.size = size
 
+    @measured('autonomy')
     def is_duplicate(self, text):
         h, s = signature(text)
         return any(
@@ -92,6 +95,7 @@ class ProactiveScheduler:
         )
 
     @locked
+    @measured('autonomy')
     def record(self, kind, text):
         d = self.presence.data
         now = self.presence.clock()
@@ -102,6 +106,7 @@ class ProactiveScheduler:
         save(self.presence.path, d)
 
     @locked
+    @measured('autonomy')
     def maybe_send(self):
         if not self.can_send():
             return
@@ -148,6 +153,7 @@ class AutonomySource:
             with self.lock:
                 self.pending.append((kind, str(payload)[:240]))
 
+    @measured('autonomy')
     def next(self):
         with self.lock:
             return (
